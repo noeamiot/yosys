@@ -708,6 +708,8 @@ struct CxxrtlWorker {
 
 	bool print_wire_types = false;
 	bool print_debug_wire_types = false;
+	bool print_symbolic = false;
+	bool allow_delta_cycle = false;
 	bool run_hierarchy = false;
 	bool run_flatten = false;
 	bool run_proc = false;
@@ -1154,15 +1156,28 @@ struct CxxrtlWorker {
 			f << ")";
 		// Muxes
 		} else if (cell->type == ID($mux)) {
-			f << "(";
-			dump_sigspec_rhs(cell->getPort(ID::S), for_debug);
-			f << " ? ";
-			dump_sigspec_rhs(cell->getPort(ID::B), for_debug);
-			f << " : ";
-			dump_sigspec_rhs(cell->getPort(ID::A), for_debug);
-			f << ")";
+			if (print_symbolic) {
+				f << "symb_mux(";
+				dump_sigspec_rhs(cell->getPort(ID::S), for_debug);
+				f << ", ";
+				dump_sigspec_rhs(cell->getPort(ID::B), for_debug);
+				f << ", ";
+				dump_sigspec_rhs(cell->getPort(ID::A), for_debug);
+				f << ")";
+			} else {
+				f << "(";
+				dump_sigspec_rhs(cell->getPort(ID::S), for_debug);
+				f << " ? ";
+				dump_sigspec_rhs(cell->getPort(ID::B), for_debug);
+				f << " : ";
+				dump_sigspec_rhs(cell->getPort(ID::A), for_debug);
+				f << ")";
+			}
 		// Parallel (one-hot) muxes
 		} else if (cell->type == ID($pmux)) {
+			if (print_symbolic)
+				log_cmd_error("Parallel (one-hot) mux encountered, run 'pmuxtree' before write_cxxrtl.\n");
+
 			int width = cell->getParam(ID::WIDTH).as_int();
 			int s_width = cell->getParam(ID::S_WIDTH).as_int();
 			for (int part = 0; part < s_width; part++) {
@@ -1423,11 +1438,22 @@ struct CxxrtlWorker {
 						f << " == value<1> {" << cell->getParam(ID::EN_POLARITY).as_bool() << "u}) {\n";
 						inc_indent();
 					}
-					f << indent;
-					dump_sigspec_lhs(cell->getPort(ID::Q));
-					f << " = ";
-					dump_sigspec_rhs(cell->getPort(ID::D));
-					f << ";\n";
+
+					// Register logic
+					if (print_symbolic) {
+						f << indent;
+						dump_sigspec_lhs(cell->getPort(ID::Q));
+						f << " = symb_register(";
+						dump_sigspec_rhs(cell->getPort(ID::D));
+						f << ");\n";
+					} else {
+						f << indent;
+						dump_sigspec_lhs(cell->getPort(ID::Q));
+						f << " = ";
+						dump_sigspec_rhs(cell->getPort(ID::D));
+						f << ";\n";
+					}
+
 					if (cell->hasPort(ID::EN) && cell->type != ID($sdffce)) {
 						dec_indent();
 						f << indent << "}\n";
@@ -2280,6 +2306,45 @@ struct CxxrtlWorker {
 		dec_indent();
 	}
 
+	void dump_symb_keep_method(RTLIL::Module *module)
+	{
+		inc_indent();
+			// For the inputs, outputs, constants, (next part of wires and memories)
+			// we keep everything that is needed (leaksets, values, nodes)
+			// For the other values and curr parts of the wires, we can clean everything (node, value, leakset)
+			// The exception is for read port wires, we keep everything as well as they are allowed not to be written every cycle
+			std::set<const RTLIL::Wire*> memReadPort;
+			for (auto &mem : mod_memories[module]) {
+				if (!writable_memories.count({module, mem.memid}))
+					continue;
+				for (auto& port : mem.rd_ports) {
+					if (port.data.is_chunk()) {
+						Yosys::RTLIL::Wire* wire = port.data.as_chunk().wire;
+						f << indent << mangle(wire) << ".symb_keep(true);\n";
+						memReadPort.insert(wire);
+					} else {
+						f << indent << "static_assert(false, 'Non chunk read port are not handled yet');\n";
+					}
+				}
+				f << indent << mangle(&mem) << ".symb_keep();\n";
+			}
+			for (auto wire : module->wires()) {
+				// If the wire is a read port, we already wrote that we want to keep it
+				if (memReadPort.find(wire) != memReadPort.end()) continue;
+
+				const auto &wire_type = wire_types[wire];
+				if (wire_type.type == WireType::MEMBER && edge_wires[wire]) {
+					f << indent << "prev_" << mangle(wire) << ".symb_keep(true);\n";
+					f << indent << mangle(wire) << ".symb_keep(true);\n";
+				}
+				else if (wire_type.is_member() && (wire->port_input || wire->port_output || wire_type.type == WireType::CONST))
+					f << indent << mangle(wire) << ".symb_keep(true);\n";
+				else if (wire_type.is_buffered() || (wire_type.is_member() && !edge_wires[wire]))
+					f << indent << mangle(wire) << ".symb_keep(false);\n";
+			}
+		dec_indent();
+	}
+
 	void dump_serialized_metadata(const dict<RTLIL::IdString, RTLIL::Const> &metadata_map) {
 		// Creating thousands metadata_map objects using initializer lists in a single function results in one of:
 		// 1. Megabytes of stack usage (with __attribute__((optnone))).
@@ -2623,6 +2688,13 @@ struct CxxrtlWorker {
 				f << indent << indent << "observer observer;\n";
 				f << indent << indent << "return commit(observer);\n";
 				f << indent << "}\n";
+				f << "\n";
+				if (print_symbolic) {
+					f << indent << "void symb_keep() override {\n";
+					dump_symb_keep_method(module);
+					f << indent << "}\n";
+					f << "\n";
+				}
 				if (debug_info) {
 					f << "\n";
 					f << indent << "void debug_info(debug_items *items, debug_scopes *scopes, "
@@ -2723,6 +2795,13 @@ struct CxxrtlWorker {
 				f << indent << indent << "observer observer;\n";
 				f << indent << indent << "return commit<>(observer);\n";
 				f << indent << "}\n";
+				f << "\n";
+				if (print_symbolic) {
+					f << indent << "void symb_keep() override {\n";
+					dump_symb_keep_method(module);
+					f << indent << "}\n";
+					f << "\n";
+				}
 				if (debug_info) {
 					if (debug_eval) {
 						f << "\n";
@@ -3118,6 +3197,10 @@ struct CxxrtlWorker {
 				log("Module `%s' contains feedback arcs through wires:\n", log_id(module));
 				for (auto wire : feedback_wires)
 					log("  %s\n", log_id(wire));
+				if (not allow_delta_cycle)
+					log_cmd_error("Feedback arcs after the cleaning step are fatal if the option -allow-delta-cycle is not given.");
+				else
+					log("There are still feedback arcs after the cleaning step but -allow-delta-cycle is given.");
 			}
 
 			// Conservatively assign wire types. Assignment of types BUFFERED and MEMBER is final, but assignment
@@ -3409,6 +3492,241 @@ struct CxxrtlWorker {
 		}
 	}
 
+	void fix_design(RTLIL::Design *design)
+	{
+		bool has_feedback_arcs = false;
+		bool has_buffered_comb_wires = false;
+
+		for (auto module : design->modules()) {
+			if (!design->selected_module(module))
+				continue;
+
+			SigMap &sigmap = sigmaps[module];
+			sigmap.set(module);
+
+			std::vector<Mem> &memories = mod_memories[module];
+			memories = Mem::get_all_memories(module);
+			for (auto &mem : memories) {
+				mem.narrow();
+				mem.coalesce_inits();
+			}
+
+			if (module->get_bool_attribute(ID(cxxrtl_blackbox))) {
+				for (auto port : module->ports) {
+					RTLIL::Wire *wire = module->wire(port);
+					if (wire->port_input && !wire->port_output) {
+						wire_types[wire] = debug_wire_types[wire] = {WireType::MEMBER};
+					} else if (wire->port_input || wire->port_output) {
+						wire_types[wire] = debug_wire_types[wire] = {WireType::BUFFERED};
+					}
+					if (wire->has_attribute(ID(cxxrtl_edge))) {
+						RTLIL::Const edge_attr = wire->attributes[ID(cxxrtl_edge)];
+						if (!(edge_attr.flags & RTLIL::CONST_FLAG_STRING) || (int)edge_attr.decode_string().size() != GetSize(wire))
+							log_cmd_error("Attribute `cxxrtl_edge' of port `%s.%s' is not a string with one character per bit.\n",
+							              log_id(module), log_signal(wire));
+
+						std::string edges = wire->get_string_attribute(ID(cxxrtl_edge));
+						for (int i = 0; i < GetSize(wire); i++) {
+							RTLIL::SigSpec wire_sig = wire;
+							switch (edges[i]) {
+								case '-': break;
+								case 'p': register_edge_signal(sigmap, wire_sig[i], RTLIL::STp); break;
+								case 'n': register_edge_signal(sigmap, wire_sig[i], RTLIL::STn); break;
+								case 'a': register_edge_signal(sigmap, wire_sig[i], RTLIL::STe); break;
+								default:
+									log_cmd_error("Attribute `cxxrtl_edge' of port `%s.%s' contains specifiers "
+									              "other than '-', 'p', 'n', or 'a'.\n",
+										log_id(module), log_signal(wire));
+							}
+						}
+					}
+				}
+
+				// Black boxes converge by default, since their implementations are quite unlikely to require
+				// internal propagation of comb signals.
+				eval_converges[module] = true;
+				continue;
+			}
+
+			for (auto wire : module->wires())
+				if (wire->has_attribute(ID::init))
+					wire_init[wire] = wire->attributes.at(ID::init);
+
+			// Construct a flow graph where each node is a basic computational operation generally corresponding
+			// to a fragment of the RTLIL netlist.
+			FlowGraph flow;
+
+			for (auto conn : module->connections())
+				flow.add_node(conn);
+
+			for (auto cell : module->cells()) {
+				if (!cell->known())
+					log_cmd_error("Unknown cell `%s'.\n", log_id(cell->type));
+
+				if (cell->is_mem_cell())
+					continue;
+
+				RTLIL::Module *cell_module = design->module(cell->type);
+				if (cell_module &&
+				    cell_module->get_blackbox_attribute() &&
+				    !cell_module->get_bool_attribute(ID(cxxrtl_blackbox)))
+					log_cmd_error("External blackbox cell `%s' is not marked as a CXXRTL blackbox.\n", log_id(cell->type));
+
+				if (cell_module &&
+				    cell_module->get_bool_attribute(ID(cxxrtl_blackbox)) &&
+				    cell_module->get_bool_attribute(ID(cxxrtl_template)))
+					blackbox_specializations[cell_module].insert(template_args(cell));
+
+				flow.add_node(cell);
+
+				// Various DFF cells are treated like posedge/negedge processes, see above for details.
+				if (cell->type.in(ID($dff), ID($dffe), ID($adff), ID($adffe), ID($aldff), ID($aldffe), ID($dffsr), ID($dffsre), ID($sdff), ID($sdffe), ID($sdffce))) {
+					if (is_valid_clock(cell->getPort(ID::CLK)))
+						register_edge_signal(sigmap, cell->getPort(ID::CLK),
+							cell->parameters[ID::CLK_POLARITY].as_bool() ? RTLIL::STp : RTLIL::STn);
+				}
+
+				// Effectful cells may be triggered on posedge/negedge events.
+				if (is_effectful_cell(cell->type) && cell->getParam(ID::TRG_ENABLE).as_bool()) {
+					for (size_t i = 0; i < (size_t)cell->getParam(ID::TRG_WIDTH).as_int(); i++) {
+						RTLIL::SigBit trg = cell->getPort(ID::TRG).extract(i, 1);
+						if (is_valid_clock(trg))
+							register_edge_signal(sigmap, trg,
+								cell->parameters[ID::TRG_POLARITY][i] == RTLIL::S1 ? RTLIL::STp : RTLIL::STn);
+					}
+				}
+			}
+
+			for (auto &mem : memories) {
+				flow.add_node(&mem);
+
+				// Clocked memory cells are treated like posedge/negedge processes as well.
+				for (auto &port : mem.rd_ports) {
+					if (port.clk_enable)
+						if (is_valid_clock(port.clk))
+							register_edge_signal(sigmap, port.clk,
+								port.clk_polarity ? RTLIL::STp : RTLIL::STn);
+					// For read ports, also move initial value to wire_init (if any).
+					for (int i = 0; i < GetSize(port.data); i++) {
+						if (port.init_value[i] != State::Sx) {
+							SigBit bit = port.data[i];
+							if (bit.wire) {
+								auto &init = wire_init[bit.wire];
+								if (init == RTLIL::Const()) {
+									init = RTLIL::Const(State::Sx, GetSize(bit.wire));
+								}
+								init.set(bit.offset, port.init_value[i]);
+							}
+						}
+					}
+				}
+				for (auto &port : mem.wr_ports) {
+					if (port.clk_enable)
+						if (is_valid_clock(port.clk))
+							register_edge_signal(sigmap, port.clk,
+								port.clk_polarity ? RTLIL::STp : RTLIL::STn);
+				}
+
+				if (!mem.wr_ports.empty())
+					writable_memories.insert({module, mem.memid});
+			}
+
+			for (auto proc : module->processes) {
+				flow.add_node(proc.second);
+
+				for (auto sync : proc.second->syncs) {
+					switch (sync->type) {
+						// Edge-type sync rules require pre-registration.
+						case RTLIL::STp:
+						case RTLIL::STn:
+						case RTLIL::STe:
+							register_edge_signal(sigmap, sync->signal, sync->type);
+							break;
+
+						// Level-type sync rules require no special handling.
+						case RTLIL::ST0:
+						case RTLIL::ST1:
+						case RTLIL::STa:
+							break;
+
+						case RTLIL::STg:
+							log_cmd_error("Global clock is not supported.\n");
+
+						// Handling of init-type sync rules is delegated to the `proc_init` pass, so we can use the wire
+						// attribute regardless of input.
+						case RTLIL::STi:
+							log_assert(false);
+					}
+					for (auto &memwr : sync->mem_write_actions) {
+						writable_memories.insert({module, memwr.memid});
+					}
+				}
+			}
+
+			// Construct a linear order of the flow graph that minimizes the amount of feedback arcs. A flow graph
+			// without feedback arcs can generally be evaluated in a single pass, i.e. it always requires only
+			// a single delta cycle.
+			Scheduler<FlowGraph::Node> scheduler;
+			dict<FlowGraph::Node*, Scheduler<FlowGraph::Node>::Vertex*> node_vertex_map;
+			for (auto node : flow.nodes)
+				node_vertex_map[node] = scheduler.add(node);
+			for (auto node_comb_def : flow.node_comb_defs) {
+				auto vertex = node_vertex_map[node_comb_def.first];
+				for (auto wire : node_comb_def.second)
+					for (auto succ_node : flow.wire_uses[wire]) {
+						auto succ_vertex = node_vertex_map[succ_node];
+						vertex->succs.insert(succ_vertex);
+						succ_vertex->preds.insert(vertex);
+					}
+			}
+
+			// Find out whether the order includes any feedback arcs.
+			std::vector<FlowGraph::Node*> node_order;
+			pool<FlowGraph::Node*> evaluated_nodes;
+			pool<const RTLIL::Wire*> feedback_wires;
+			for (auto vertex : scheduler.schedule()) {
+				auto node = vertex->data;
+				node_order.push_back(node);
+				// Any wire that is an output of node vo and input of node vi where vo is scheduled later than vi
+				// is a feedback wire. Feedback wires indicate apparent logic loops in the design, which may be
+				// caused by a true logic loop, but usually are a benign result of dependency tracking that works
+				// on wire, not bit, level. Nevertheless, feedback wires cannot be unbuffered.
+				evaluated_nodes.insert(node);
+				for (auto wire : flow.node_comb_defs[node])
+					for (auto succ_node : flow.wire_uses[wire])
+						if (evaluated_nodes[succ_node])
+							feedback_wires.insert(wire);
+			}
+			if (!feedback_wires.empty()) {
+				has_feedback_arcs = true;
+				log("Module `%s' contains feedback arcs through wires:\n", log_id(module));
+				for (auto wire : feedback_wires) {
+					log("  %s\n", log_id(wire));
+					// We format here the name to identify later which wires have been splitted and what their group is
+					string test("splitnets -format @@ w:");
+					test.append(log_id(wire));
+					log("%s\n", test.c_str());
+					Pass::call(design, test.c_str());
+				}
+			}
+		}
+		if (has_feedback_arcs || has_buffered_comb_wires) {
+			// Although both non-feedback buffered combinatorial wires and apparent feedback wires may be eliminated
+			// by optimizing the design, if after `proc; flatten` there are any feedback wires remaining, it is very
+			// likely that these feedback wires are indicative of a true logic loop, so they get emphasized in the message.
+			const char *why_pessimistic = nullptr;
+			if (has_feedback_arcs)
+				why_pessimistic = "feedback wires";
+			else if (has_buffered_comb_wires)
+				why_pessimistic = "buffered combinatorial wires";
+			log_warning("FIX: Design contained %s, which require delta cycles during evaluation.\n", why_pessimistic);
+			if (!run_flatten)
+				log("Flattening may eliminate %s from the design.\n", why_pessimistic);
+			if (!run_proc)
+				log("Converting processes to netlists may eliminate %s from the design.\n", why_pessimistic);
+		}
+	}
+
 	void check_design(RTLIL::Design *design, bool &has_sync_init)
 	{
 		has_sync_init = false;
@@ -3455,6 +3773,8 @@ struct CxxrtlWorker {
 			Pass::call(design, "proc_init");
 			did_anything = true;
 		}
+		if (not allow_delta_cycle)
+			fix_design(design);
 		// Recheck the design if it was modified.
 		if (did_anything)
 			check_design(design, has_sync_init);
@@ -3633,6 +3953,9 @@ struct CxxrtlBackend : public Backend {
 		log("    -print-wire-types, -print-debug-wire-types\n");
 		log("        enable additional debug logging, for pass developers.\n");
 		log("\n");
+		log("    -print-symbolic\n");
+		log("        generates the symbolic registers function calls, default is disabled\n");
+		log("\n");
 		log("    -header\n");
 		log("        generate separate interface (.h) and implementation (.cc) files.\n");
 		log("        if specified, the backend must be called with a filename, and filename\n");
@@ -3719,6 +4042,8 @@ struct CxxrtlBackend : public Backend {
 	{
 		bool print_wire_types = false;
 		bool print_debug_wire_types = false;
+		bool print_symbolic = false;
+		bool allow_delta_cycle = false;
 		bool nohierarchy = false;
 		bool noflatten = false;
 		bool noproc = false;
@@ -3737,6 +4062,14 @@ struct CxxrtlBackend : public Backend {
 			}
 			if (args[argidx] == "-print-debug-wire-types") {
 				print_debug_wire_types = true;
+				continue;
+			}
+			if (args[argidx] == "-print-symbolic") {
+				print_symbolic = true;
+				continue;
+			}
+			if (args[argidx] == "-allow-delta-cycle") {
+				allow_delta_cycle = true;
 				continue;
 			}
 			if (args[argidx] == "-nohierarchy") {
@@ -3800,6 +4133,8 @@ struct CxxrtlBackend : public Backend {
 
 		worker.print_wire_types = print_wire_types;
 		worker.print_debug_wire_types = print_debug_wire_types;
+		worker.print_symbolic = print_symbolic;
+		worker.allow_delta_cycle = allow_delta_cycle;
 		worker.run_hierarchy = !nohierarchy;
 		worker.run_flatten = !noflatten;
 		worker.run_proc = !noproc;
@@ -3828,6 +4163,19 @@ struct CxxrtlBackend : public Backend {
 			default:
 				log_cmd_error("Invalid optimization level %d.\n", opt_level);
 		}
+
+		// Hack for now
+		if (worker.print_symbolic) {
+			worker.unbuffer_internal = true;
+			worker.localize_internal = true;
+			worker.inline_internal = true;
+			worker.unbuffer_public = true;
+			worker.localize_public = false;
+			worker.inline_public = false;
+			if (opt_level != 4)
+				log_warning("For symbolic prints, optimization level reset to -O4.\n");
+		}
+
 		switch (debug_level) {
 			// the highest level here must match DEFAULT_DEBUG_LEVEL
 			case 4:
